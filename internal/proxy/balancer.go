@@ -54,6 +54,13 @@ func (lb *RoundRobinLoadBalancer) Next(backends []*Backend) *Backend {
 		totalWeight += b.Weight
 	}
 
+	// 若所有权重均为 0，降级为简单轮询，避免除零 panic
+	if totalWeight == 0 {
+		idx := lb.current % len(backends)
+		lb.current++
+		return backends[idx]
+	}
+
 	// 按权重范围定位：将 current 映射到 [0, totalWeight) 区间
 	pos := lb.current % totalWeight
 	lb.current++

@@ -179,3 +179,27 @@ func TestRoundRobin_DifferentWeights(t *testing.T) {
 		t.Errorf("c.local (weight 1): expected 10, got %d", counts["c.local"])
 	}
 }
+
+func TestRoundRobin_AllZeroWeights(t *testing.T) {
+	backends := []*Backend{
+		{URL: mustParseURL("http://localhost:9001"), Weight: 0, Healthy: true},
+		{URL: mustParseURL("http://localhost:9002"), Weight: 0, Healthy: true},
+		{URL: mustParseURL("http://localhost:9003"), Weight: 0, Healthy: true},
+	}
+
+	lb := NewRoundRobinLoadBalancer()
+
+	// 不应 panic，且应在 3 个后端间简单轮询
+	for round := 0; round < 2; round++ {
+		for i, expectedPort := range []string{"9001", "9002", "9003"} {
+			got := lb.Next(backends)
+			if got == nil {
+				t.Fatalf("round %d, call %d: expected non-nil backend", round, i)
+			}
+			if got.URL.Port() != expectedPort {
+				t.Errorf("round %d, call %d: expected port %s, got %s",
+					round, i, expectedPort, got.URL.Port())
+			}
+		}
+	}
+}
