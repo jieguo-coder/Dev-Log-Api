@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net"
@@ -10,6 +9,8 @@ import (
 	"net/http/httputil"
 	"strings"
 	"time"
+
+	"github.com/jieguo-coder/mini-gateway/internal/response"
 )
 
 // Proxy 反向代理接口。
@@ -108,7 +109,7 @@ func (p *ReverseProxy) errorHandler(w http.ResponseWriter, r *http.Request, err 
 	)
 
 	statusCode, errorCode := classifyProxyError(err)
-	writeErrorJSON(w, statusCode, errorCode, err.Error())
+	response.WriteErrorJSON(w, r, statusCode, errorCode, err.Error())
 }
 
 // classifyProxyError 根据错误类型映射 HTTP 状态码和业务错误码。
@@ -127,26 +128,6 @@ func classifyProxyError(err error) (int, string) {
 
 	// 其余归类为内部错误（包括未知的传输层错误）
 	return http.StatusInternalServerError, "INTERNAL_ERROR"
-}
-
-// writeErrorJSON 按 SPEC 第 5.2 节格式写入 JSON 错误响应。
-func writeErrorJSON(w http.ResponseWriter, statusCode int, errorCode, message string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(statusCode)
-
-	resp := map[string]interface{}{
-		"error": map[string]interface{}{
-			"code":    errorCode,
-			"message": message,
-		},
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-	}
-
-	// 从 context 中尝试提取 request_id（如果 Router 已注入）
-	// 当前 MVP 阶段 Router 尚未实现，使用占位符
-	resp["request_id"] = "-"
-
-	json.NewEncoder(w).Encode(resp)
 }
 
 // SetTransport 设置底层 HTTP Transport。
@@ -173,7 +154,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 若没有可用后端，直接返回 502
 	if len(p.backends) == 0 {
-		writeErrorJSON(w, http.StatusBadGateway, "BAD_GATEWAY", "no backend available")
+		response.WriteErrorJSON(w, r, http.StatusBadGateway, "BAD_GATEWAY", "no backend available")
 		return
 	}
 

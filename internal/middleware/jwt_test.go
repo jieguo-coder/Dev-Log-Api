@@ -308,4 +308,7 @@ func TestJWTAuth_MissingRequiredClaim(t *testing.T) {
 	if errObj["code"] != "FORBIDDEN" {
 		t.Errorf("expected code FORBIDDEN, got %q", errObj["code"])
 	}
+	if errObj["message"] != "insufficient permissions" {
+		t.Errorf("expected generic message, got %q", errObj["message"])
+	}
 }

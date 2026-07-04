@@ -2,65 +2,133 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 
+	"golang.org/x/time/rate"
+
 	"github.com/jieguo-coder/mini-gateway/internal/config"
+	"github.com/jieguo-coder/mini-gateway/internal/middleware"
+	"github.com/jieguo-coder/mini-gateway/internal/proxy"
+	"github.com/jieguo-coder/mini-gateway/internal/response"
+	"github.com/jieguo-coder/mini-gateway/internal/router"
 )
 
 func main() {
-	// 解析命令行参数
 	configPath := flag.String("config", "config.yaml", "path to gateway configuration file")
 	flag.Parse()
 
-	// 初始化默认结构化日志（配置加载前使用 Info 级别）
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	// 加载配置
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		slog.Error("failed to load configuration", "error", err, "path", *configPath)
 		os.Exit(1)
 	}
-
-	// 根据配置文件动态更新日志级别
 	updateLogLevel(cfg.Logging.Level)
+	slog.Info("configuration loaded", "routes", len(cfg.Routes))
 
-	slog.Info("configuration loaded successfully",
-		"host", cfg.Server.Host,
-		"port", cfg.Server.Port,
-		"routes_count", len(cfg.Routes),
-		"log_level", cfg.Logging.Level,
-	)
+	// ─── 创建全局中间件实例 ──────────────────────────────────
+	var jwtAuth *middleware.JWTAuth
+	if cfg.JWT.Enabled {
+		jwtAuth, err = middleware.NewJWTAuth(middleware.JWTConfig{
+			Secret:            []byte(cfg.JWT.Secret),
+			Algorithm:         cfg.JWT.Algorithm,
+			RequiredClaims:    cfg.JWT.Claims.Required,
+			IssuerAllowlist:   toSet(cfg.JWT.Claims.IssuerAllowlist),
+			AudienceAllowlist: toSet(cfg.JWT.Claims.AudienceAllowlist),
+		})
+		if err != nil {
+			slog.Error("failed to create JWT middleware", "error", err)
+			os.Exit(1)
+		}
+	}
 
-	// 构建 HTTP Server
-	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
+	var rateLimiter *middleware.RateLimiter
+	if cfg.RateLimit.Enabled {
+		rateLimiter = middleware.NewRateLimiter(
+			rate.Limit(cfg.RateLimit.DefaultRate),
+			cfg.RateLimit.DefaultBurst,
+			cfg.RateLimit.KeyBy,
+			cfg.RateLimit.CleanupInterval,
+		)
+		defer rateLimiter.Stop()
+	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "Gateway is running")
+	// ─── 为每条路由创建 Proxy + 组装中间件链 ─────────────────
+	trieRouter := router.NewTrieRouter()
+	jwtBeforeRL := strings.Contains(cfg.RateLimit.KeyBy, "jwt_claim")
+
+	for _, rc := range cfg.Routes {
+		backends := buildBackends(rc)
+		if len(backends) == 0 {
+			slog.Warn("skipping route with no valid backends", "route", rc.Name)
+			continue
+		}
+
+		lb := proxy.NewRoundRobinLoadBalancer()
+		rp := proxy.NewReverseProxy(backends, lb, rc.Timeout, rc.StripPrefix, rc.SetHeaders)
+
+		// 动态组装中间件链
+		var mws []middleware.Middleware
+		if jwtBeforeRL {
+			addIf(!rc.SkipAuth && jwtAuth != nil, &mws, jwtAuth.Middleware())
+			addIf(!rc.SkipRateLimit && rateLimiter != nil, &mws, rateLimiter.Middleware())
+		} else {
+			addIf(!rc.SkipRateLimit && rateLimiter != nil, &mws, rateLimiter.Middleware())
+			addIf(!rc.SkipAuth && jwtAuth != nil, &mws, jwtAuth.Middleware())
+		}
+
+		handler := middleware.Chain(mws...)(rp)
+
+		// 构造 Router 路由
+		rt := router.Route{
+			Name:          rc.Name,
+			Method:        rc.Method,
+			Matcher:       buildMatcher(rc.Path.Type, rc.Path.Value),
+			Handler:       handler,
+			SkipAuth:      rc.SkipAuth,
+			SkipRateLimit: rc.SkipRateLimit,
+			Timeout:       rc.Timeout,
+			Retry:         rc.Retry,
+			StripPrefix:   rc.StripPrefix,
+			SetHeaders:    rc.SetHeaders,
+		}
+		if rc.RateLimit != nil {
+			rt.RateLimit = &router.RouteRateLimitConfig{Rate: rc.RateLimit.Rate, Burst: rc.RateLimit.Burst}
+		}
+
+		trieRouter.AddRoute(rt)
+		slog.Info("route registered", "name", rc.Name, "method", rc.Method, "path", rc.Path.Value)
+	}
+
+	// ─── 顶层 Handler：注入 request_id → Router ──────────────
+	mainHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := generateRequestID()
+		w.Header().Set("X-Request-Id", reqID)
+		trieRouter.ServeHTTP(w, response.SetRequestID(r, reqID))
 	})
 
+	// ─── 启动 Server + 优雅关停 ──────────────────────────────
+	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	srv := &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      mainHandler,
 		ReadTimeout:  cfg.Server.ReadTimeout,
 		WriteTimeout: cfg.Server.WriteTimeout,
 		IdleTimeout:  cfg.Server.IdleTimeout,
 	}
 
-	// errChan 用于接收 ListenAndServe 的致命错误（端口占用等）
 	errChan := make(chan error, 1)
 	go func() {
 		slog.Info("gateway server starting", "addr", addr)
@@ -69,30 +137,27 @@ func main() {
 		}
 	}()
 
-	// 等待中断信号或服务崩溃
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	select {
 	case sig := <-quit:
-		slog.Info("received shutdown signal, starting graceful shutdown...", "signal", sig.String())
+		slog.Info("received shutdown signal", "signal", sig.String())
 	case err := <-errChan:
-		slog.Error("server encountered fatal error, shutting down...", "error", err)
+		slog.Error("server fatal error, shutting down", "error", err)
 	}
 
-	// 优雅关停：在配置的超时时间内等待活跃请求完成
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancel()
-
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Error("server forced to shutdown", "error", err)
 		os.Exit(1)
 	}
-
 	slog.Info("server exited gracefully")
 }
 
-// updateLogLevel 根据配置字符串动态设置 slog 的日志级别。
+// ─── Helpers ──────────────────────────────────────────────────
+
 func updateLogLevel(level string) {
 	var lvl slog.Level
 	switch strings.ToLower(level) {
@@ -105,12 +170,51 @@ func updateLogLevel(level string) {
 	case "error":
 		lvl = slog.LevelError
 	default:
-		slog.Warn("unknown log level, falling back to info", "level", level)
 		lvl = slog.LevelInfo
 	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})))
+}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: lvl,
-	}))
-	slog.SetDefault(logger)
+func toSet(list []string) map[string]bool {
+	m := make(map[string]bool, len(list))
+	for _, s := range list {
+		m[s] = true
+	}
+	return m
+}
+
+func addIf(cond bool, mws *[]middleware.Middleware, mw middleware.Middleware) {
+	if cond {
+		*mws = append(*mws, mw)
+	}
+}
+
+func buildBackends(rc config.RouteConfig) []*proxy.Backend {
+	var out []*proxy.Backend
+	for _, bc := range rc.Backends {
+		u, err := url.Parse(bc.URL)
+		if err != nil {
+			slog.Warn("invalid backend URL", "url", bc.URL, "route", rc.Name, "error", err)
+			continue
+		}
+		out = append(out, &proxy.Backend{URL: u, Weight: bc.Weight, Healthy: true})
+	}
+	return out
+}
+
+func buildMatcher(matchType, value string) router.PathMatcher {
+	switch matchType {
+	case "exact":
+		return router.NewExactMatcher(value)
+	case "prefix":
+		return router.NewPrefixMatcher(value)
+	default:
+		return router.NewPrefixMatcher(value)
+	}
+}
+
+func generateRequestID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }

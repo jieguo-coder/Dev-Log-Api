@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -10,6 +9,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/jieguo-coder/mini-gateway/internal/response"
 )
 
 // JWTConfig JWT 鉴权中间件配置（与 config 包解耦）。
@@ -59,7 +60,8 @@ func (a *JWTAuth) Middleware() Middleware {
 			// 1. 提取 Authorization header
 			authHeader := r.Header.Get("Authorization")
 			if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-				a.writeUnauthorized(w, "UNAUTHORIZED", "missing or malformed Authorization header")
+				response.WriteErrorJSON(w, r, http.StatusUnauthorized, "UNAUTHORIZED",
+					"missing or malformed Authorization header")
 				return
 			}
 
@@ -69,25 +71,28 @@ func (a *JWTAuth) Middleware() Middleware {
 			claims := &JWTCustomClaims{}
 			token, err := jwt.ParseWithClaims(tokenString, claims,
 				func(t *jwt.Token) (interface{}, error) {
-					// 验证签名算法
 					if t.Method.Alg() != a.signingMethod.Alg() {
 						return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 					}
 					return a.secret, nil
 				},
-				jwt.WithLeeway(5*time.Second), // 5 秒时钟偏差容忍
+				jwt.WithLeeway(5*time.Second),
 			)
 
 			if err != nil || !token.Valid {
+				// 安全：日志记录真实错误用于排查，返回通用消息给客户端
 				slog.Warn("jwt validation failed", "error", err, "path", r.URL.Path)
-				a.writeUnauthorized(w, "UNAUTHORIZED", fmt.Sprintf("invalid token: %v", err))
+				response.WriteErrorJSON(w, r, http.StatusUnauthorized, "UNAUTHORIZED",
+					"invalid or expired token")
 				return
 			}
 
 			// 3. 校验 Claims
 			if err := a.validateClaims(claims); err != nil {
+				// 安全：日志记录真实错误，返回通用消息
 				slog.Warn("jwt claims validation failed", "error", err, "path", r.URL.Path)
-				a.writeUnauthorized(w, "FORBIDDEN", err.Error())
+				response.WriteErrorJSON(w, r, http.StatusForbidden, "FORBIDDEN",
+					"insufficient permissions")
 				return
 			}
 
@@ -148,28 +153,6 @@ func (a *JWTAuth) validateClaims(claims *JWTCustomClaims) error {
 	}
 
 	return nil
-}
-
-// writeUnauthorized 返回统一 JSON 格式的鉴权失败响应。
-func (a *JWTAuth) writeUnauthorized(w http.ResponseWriter, code, message string) {
-	statusCode := http.StatusUnauthorized
-	if code == "FORBIDDEN" {
-		statusCode = http.StatusForbidden
-	}
-
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(statusCode)
-
-	resp := map[string]interface{}{
-		"error": map[string]interface{}{
-			"code":    code,
-			"message": message,
-		},
-		"request_id": "-",
-		"timestamp":  time.Now().UTC().Format(time.RFC3339),
-	}
-
-	json.NewEncoder(w).Encode(resp)
 }
 
 // FromContext 从 context 中提取已验证的 JWT Claims。
