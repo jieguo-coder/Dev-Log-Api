@@ -1,0 +1,24 @@
+# ==========================================
+# Mini API Gateway - Git Ignore Rules
+# ==========================================
+
+# 1. AI 辅助编程与本地配置 (满足你的需求)
+SPEC.md
+.claude/
+.claudecode/
+.cursorrules
+
+# 2. 编译产物 (千万不要把二进制可执行文件传上 Github)
+/bin/
+*.exe
+*.test
+*.out
+
+# 3. 敏感配置与密钥
+config.yaml
+.env
+
+# 4. IDE 与系统文件
+.idea/
+.vscode/
+.DS_Store
