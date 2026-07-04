@@ -3,7 +3,9 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"strings"
@@ -110,34 +112,20 @@ func (p *ReverseProxy) errorHandler(w http.ResponseWriter, r *http.Request, err 
 }
 
 // classifyProxyError 根据错误类型映射 HTTP 状态码和业务错误码。
+// 使用 errors.Is / errors.As 进行类型断言，而非字符串匹配。
 func classifyProxyError(err error) (int, string) {
-	if err == nil {
-		return http.StatusOK, ""
-	}
-
-	errStr := err.Error()
-
-	// 超时错误
-	if strings.Contains(errStr, "timeout") ||
-		strings.Contains(errStr, "deadline exceeded") ||
-		strings.Contains(errStr, "context deadline exceeded") {
+	// 超时：context.DeadlineExceeded（httputil 通过 context 超时取消请求）
+	if errors.Is(err, context.DeadlineExceeded) {
 		return http.StatusGatewayTimeout, "GATEWAY_TIMEOUT"
 	}
 
-	// 后端无可用
-	if strings.Contains(errStr, "no backend") {
+	// 连接层错误：*net.OpError（连接拒绝、DNS 解析失败等）
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
 		return http.StatusBadGateway, "BAD_GATEWAY"
 	}
 
-	// 连接拒绝 / DNS 解析失败
-	if strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "no such host") ||
-		strings.Contains(errStr, "dial") ||
-		strings.Contains(errStr, "connect") {
-		return http.StatusBadGateway, "BAD_GATEWAY"
-	}
-
-	// 其余归类为内部错误
+	// 其余归类为内部错误（包括未知的传输层错误）
 	return http.StatusInternalServerError, "INTERNAL_ERROR"
 }
 
