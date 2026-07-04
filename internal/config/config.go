@@ -103,7 +103,11 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	// 替换环境变量占位符: ${VAR_NAME} → os.Getenv("VAR_NAME")
-	content := expandEnvVars(string(data))
+	// 若引用的环境变量未设置或为空，拒绝启动
+	content, err := expandEnvVars(string(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to expand env vars in %q: %w", path, err)
+	}
 
 	var cfg Config
 	if err := yaml.Unmarshal([]byte(content), &cfg); err != nil {
@@ -122,8 +126,8 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // expandEnvVars 替换字符串中的 ${VAR_NAME} 占位符为对应的环境变量值。
-// 若环境变量不存在，则保留原占位符不变。
-func expandEnvVars(s string) string {
+// 若引用的环境变量未设置或为空，返回 error，拒绝静默降级。
+func expandEnvVars(s string) (string, error) {
 	var result strings.Builder
 	result.Grow(len(s))
 
@@ -140,6 +144,9 @@ func expandEnvVars(s string) string {
 			}
 			varName := s[i+2 : i+2+end]
 			envVal := os.Getenv(varName)
+			if envVal == "" {
+				return "", fmt.Errorf("environment variable %q is not set or empty", varName)
+			}
 			result.WriteString(envVal)
 			i += 2 + end + 1 // 跳过 ${VAR_NAME}
 			continue
@@ -148,7 +155,7 @@ func expandEnvVars(s string) string {
 		i++
 	}
 
-	return result.String()
+	return result.String(), nil
 }
 
 // applyDefaults 填充配置的默认值。

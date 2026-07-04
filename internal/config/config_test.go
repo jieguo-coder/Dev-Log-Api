@@ -176,6 +176,47 @@ logging: {}
 	}
 }
 
+func TestLoadConfig_EnvVarNotSet(t *testing.T) {
+	// 确保环境变量不存在
+	os.Unsetenv("MISSING_ENV_VAR")
+
+	tmpDir := t.TempDir()
+	cfgContent := `
+server:
+  port: 8080
+rate_limit:
+  key_by: "ip"
+jwt:
+  secret: "${MISSING_ENV_VAR}"
+  algorithm: "HS256"
+routes:
+  - name: "test"
+    method: "GET"
+    path:
+      type: "exact"
+      value: "/"
+    backends:
+      - url: "http://localhost:9000"
+        weight: 1
+logging: {}
+`
+	path := filepath.Join(tmpDir, "missing_env.yaml")
+	if err := os.WriteFile(path, []byte(cfgContent), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("expected error for missing env var, got nil")
+	}
+	if !strings.Contains(err.Error(), "environment variable") {
+		t.Errorf("error should mention 'environment variable', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "MISSING_ENV_VAR") {
+		t.Errorf("error should mention the variable name 'MISSING_ENV_VAR', got: %v", err)
+	}
+}
+
 func TestLoadConfig_ValidationErrors(t *testing.T) {
 	tests := []struct {
 		name    string
